@@ -26,6 +26,8 @@ struct CommandLine {
           -matchcount LO [HI]
           -silent, -quiet        output comment levels
           -matchstring TEXT      comment for matched positions
+          -strict                stop at the first game that cannot be read
+                                 (by default such games are skipped with a warning)
           -parse                 only parse the CQL and print the syntax tree
           -stdout                write matching games to standard output
         """
@@ -61,6 +63,7 @@ struct CommandLine {
             case "-quiet": options.quiet = true
             case "-matchstring": options.matchString = try next()
             case "-noheader": options.headerComments = false
+            case "-strict": options.onInvalidGame = { _ in .abort }
             case "-parse": parseOnly = true
             case "-stdout": printToStdout = true
             case "-h", "-help":
@@ -102,11 +105,17 @@ func run() throws {
     guard let input = command.input ?? program.header.input else {
         throw CQLError(.input, "no input PGN file (use -i or the 'input' header parameter)")
     }
-    let pgn = try String(contentsOfFile: input, encoding: .utf8)
     let engine = try CQLEngine(program: program, options: command.options)
     let start = Date()
-    let result = try engine.run(pgn: pgn)
+    let result = try engine.run(contentsOf: URL(fileURLWithPath: input))
     let elapsed = Date().timeIntervalSince(start)
+    for skipped in result.skippedGames {
+        FileHandle.standardError.write("cql-swift: warning: skipped \(skipped)\n".data(using: .utf8)!)
+    }
+    for partial in result.partiallyReadGames {
+        FileHandle.standardError.write("cql-swift: warning: partially read \(partial)\n".data(using: .utf8)!)
+    }
+    let skippedNote = result.skippedGames.isEmpty ? "" : " (\(result.skippedGames.count) unreadable game(s) skipped)"
 
     if command.printToStdout {
         print(result.outputPGN)
@@ -114,7 +123,7 @@ func run() throws {
         let base = command.cqlFile.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? "cqldefault"
         let outputPath = command.output ?? program.header.output ?? "\(base)-out.pgn"
         try result.outputPGN.write(toFile: outputPath, atomically: true, encoding: .utf8)
-        FileHandle.standardError.write("\(result.matches.count) matching game(s) of \(result.gamesExamined) written to \(outputPath) in \(String(format: "%.2f", elapsed))s\n".data(using: .utf8)!)
+        FileHandle.standardError.write("\(result.matches.count) matching game(s) of \(result.gamesExamined)\(skippedNote) written to \(outputPath) in \(String(format: "%.2f", elapsed))s\n".data(using: .utf8)!)
     }
     for (name, value) in result.persistentVariables {
         print("\(name): \(value)")

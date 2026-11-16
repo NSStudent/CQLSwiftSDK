@@ -5,7 +5,7 @@ A Swift package (SPM) that parses and runs **CQL 6.2** ([Chess Query Language](h
 ## Installation
 
 ```swift
-.package(url: "https://github.com/NSStudent/CQLSwiftSDK.git", from: "0.1.0")
+.package(url: "https://github.com/NSStudent/CQLSwiftSDK.git", from: "0.1.1")
 ```
 
 Then add `.product(name: "CQL", package: "CQLSwiftSDK")` to your target's dependencies. Requires Swift 6.0 or later, macOS 13 or iOS 16.
@@ -36,11 +36,28 @@ for match in result.matches {
 print(result.outputPGN)   // matching games, annotated with {CQL} and generated comments
 ```
 
+### Reading PGN input
+
+Games are read one at a time, so a broken game does not stop the run:
+
+- `run(pgn:)`, `run(pgnData:)` and `run(contentsOf:)` (which reads files incrementally, decoding each line as UTF-8 or Latin-1) skip games that cannot be read and list them in `CQLResult.skippedGames`, with their game number, byte offset and reason. Game numbers keep their position in the input.
+- `CQLResult.partiallyReadGames` lists games that were searched only up to an illegal or unreadable move.
+- To decide case by case, set `Options.onInvalidGame`: return `.skip` to continue or `.abort` to stop the run with a `CQLError`.
+
+```swift
+var options = CQLEngine.Options()
+options.onInvalidGame = { error in
+    print("skipping \(error)")
+    return .skip          // or .abort
+}
+let result = try CQLEngine(source: source, options: options).run(contentsOf: pgnURL)
+```
+
 The API is layered:
 
 - `Lexer.tokenize(_:)`: tokens, with Unicode spellings normalised to their ASCII equivalents (`→`≡`->`, `――`≡`--`, `♔`≡`K`, …).
 - `Parser.parse(_:) -> CQLProgram`: the header (`CQLHeader`) and the body (`Filter`, an `indirect enum` AST).
-- `GameTree.games(fromPGN:)`: the position tree of each game, with variations, `positionid` and piece identities.
+- `GameTree.read(pgn:)`: the position tree of each game, with variations, `positionid` and piece identities, plus the games that could not be read. `GameTree.games(fromPGN:)` throws on the first unreadable game instead.
 - `Evaluator`: evaluates filters at a position.
 - `CQLEngine`: the main loop (matchcount, gamenumber, sort, PGN output).
 
@@ -52,7 +69,9 @@ swift run cql-swift -i games.pgn -stdout -cql 'mate ♘==2'
 swift run cql-swift -parse search.cql                # prints the AST
 ```
 
-Options: `-i/-input`, `-o/-output`, `-cql`, `-variations`, `-mainline`, `-g/-gamenumber`, `-matchcount`, `-silent`, `-quiet`, `-matchstring`, `-noheader`, `-parse`, `-stdout`.
+Options: `-i/-input`, `-o/-output`, `-cql`, `-variations`, `-mainline`, `-g/-gamenumber`, `-matchcount`, `-silent`, `-quiet`, `-matchstring`, `-noheader`, `-strict`, `-parse`, `-stdout`.
+
+Unreadable games are skipped with a warning on standard error; `-strict` stops at the first one instead.
 
 ## Implementation status
 

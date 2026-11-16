@@ -1,4 +1,5 @@
 import FischerCore
+import Foundation
 
 /// The result of matching one game against a CQL program.
 public struct GameMatch: Sendable {
@@ -16,12 +17,43 @@ public struct GameMatch: Sendable {
     public let game: GameTree
 }
 
+/// A game that could not be read from the PGN input.
+public struct GameReadError: Error, Sendable, CustomStringConvertible {
+    /// 1-based position of the game in the input.
+    public let gameNumber: Int
+    /// Byte offset where the game starts in the input.
+    public let byteOffset: Int64
+    /// Why the game could not be read.
+    public let reason: String
+
+    public init(gameNumber: Int, byteOffset: Int64, reason: String) {
+        self.gameNumber = gameNumber
+        self.byteOffset = byteOffset
+        self.reason = reason
+    }
+
+    public var description: String { "game \(gameNumber) (byte \(byteOffset)): \(reason)" }
+}
+
+/// What to do when a game in the PGN input cannot be read.
+public enum InvalidGameDecision: Sendable {
+    /// Skip the game, record it in ``CQLResult/skippedGames`` and continue.
+    case skip
+    /// Stop the run and throw a ``CQLError``.
+    case abort
+}
+
 /// The outcome of running a CQL program over a PGN collection.
 public struct CQLResult: Sendable {
     /// Matching games, in output order (sorted if the program sorts).
     public let matches: [GameMatch]
     /// Number of games examined.
     public let gamesExamined: Int
+    /// Games that could not be read and were skipped.
+    public let skippedGames: [GameReadError]
+    /// Games that were searched only up to an unreadable or illegal move;
+    /// the moves after it were ignored.
+    public let partiallyReadGames: [GameReadError]
     /// Persistent variables at the end of the run (excluding `quiet` ones).
     public let persistentVariables: [(name: String, value: Value)]
 
@@ -43,6 +75,9 @@ public final class CQLEngine {
         public var matchString: String?
         /// Whether to add the "game number" header comment to matching games.
         public var headerComments = true
+        /// Decides what happens when a game cannot be read. The default skips
+        /// it (see ``CQLResult/skippedGames``); return `.abort` to stop the run.
+        public var onInvalidGame: @Sendable (GameReadError) -> InvalidGameDecision = { _ in .skip }
 
         public init() {}
     }
@@ -50,7 +85,7 @@ public final class CQLEngine {
     public let program: CQLProgram
     public let options: Options
     public let evaluator: Evaluator
-    private let sortKeys: [(key: String, minimum: Bool)]
+    fileprivate let sortKeys: [(key: String, minimum: Bool)]
 
     public init(program: CQLProgram, options: Options = Options()) throws(CQLError) {
         self.program = program
@@ -67,43 +102,125 @@ public final class CQLEngine {
     }
 
     /// Runs the program over every game of a PGN document.
+    ///
+    /// Games that cannot be read are handled by ``Options/onInvalidGame``.
     public func run(pgn: String) throws(CQLError) -> CQLResult {
+        try run(pgnData: Data(pgn.utf8))
+    }
+
+    /// Runs the program over PGN bytes (UTF-8, or Latin-1 line by line).
+    public func run(pgnData: Data) throws(CQLError) -> CQLResult {
         try withLargeStack { () throws(CQLError) -> CQLResult in
-            let games: [GameTree]
+            let chunks = PGNGameSplitter.chunks(in: pgnData)
+            var run = Run(engine: self, knownGameCount: chunks.count)
+            try run.consume(chunks)
+            return run.finish()
+        }
+    }
+
+    /// Runs the program over a PGN file, reading it incrementally.
+    ///
+    /// Memory use depends on the matching games, not on the size of the file.
+    /// `lastgamenumber` is only known when the CQL header or the options give
+    /// a game number range.
+    public func run(contentsOf url: URL, blockSize: Int = 1 << 20) throws(CQLError) -> CQLResult {
+        try withLargeStack { () throws(CQLError) -> CQLResult in
+            let handle: FileHandle
             do {
-                games = try GameTree.games(fromPGN: pgn)
+                handle = try FileHandle(forReadingFrom: url)
             } catch {
-                throw CQLError(.input, "cannot read PGN: \(error)")
+                throw CQLError(.input, "cannot open \(url.path): \(error.localizedDescription)")
             }
-            return try self.runGames(games)
+            defer { try? handle.close() }
+            var chunker = PGNByteChunker()
+            var run = Run(engine: self, knownGameCount: nil)
+            while true {
+                let block: Data
+                do {
+                    block = try handle.read(upToCount: blockSize) ?? Data()
+                } catch {
+                    throw CQLError(.input, "cannot read \(url.path): \(error.localizedDescription)")
+                }
+                if block.isEmpty { break }
+                try run.consume(chunker.consume(block))
+            }
+            try run.consume(chunker.finish())
+            return run.finish()
         }
     }
 
     public func run(games: [GameTree]) throws(CQLError) -> CQLResult {
-        try withLargeStack { () throws(CQLError) -> CQLResult in try self.runGames(games) }
+        try withLargeStack { () throws(CQLError) -> CQLResult in
+            var run = Run(engine: self, knownGameCount: games.count)
+            for game in games { try run.process(game) }
+            return run.finish()
+        }
     }
 
-    private func runGames(_ games: [GameTree]) throws(CQLError) -> CQLResult {
-        let header = program.header
-        let gameRange = options.gameNumber ?? header.gameNumber
-        let countRange = options.matchCount ?? header.matchCount
-        evaluator.lastGameNumberValue = min(games.count, gameRange?.upperBound ?? games.count)
+    /// The state of one run over a PGN collection.
+    private struct Run {
+        let engine: CQLEngine
+        let gameRange: ClosedRange<Int>?
+        let countRange: ClosedRange<Int>?
         var matches: [GameMatch] = []
         var examined = 0
-        for game in games {
-            if let gameRange, !gameRange.contains(game.gameNumber) { continue }
-            if let result = header.result, game.tags["Result"] != result { continue }
+        var skipped: [GameReadError] = []
+        var partial: [GameReadError] = []
+
+        init(engine: CQLEngine, knownGameCount: Int?) {
+            self.engine = engine
+            let header = engine.program.header
+            gameRange = engine.options.gameNumber ?? header.gameNumber
+            countRange = engine.options.matchCount ?? header.matchCount
+            let last = [knownGameCount, gameRange?.upperBound].compactMap { $0 }.min() ?? Int.max
+            engine.evaluator.lastGameNumberValue = last
+        }
+
+        /// Reads and matches each game; unreadable games go through `onInvalidGame`.
+        mutating func consume(_ chunks: [PGNGameChunk]) throws(CQLError) {
+            for chunk in chunks {
+                let gameNumber = chunk.index + 1
+                if let gameRange, !gameRange.contains(gameNumber) { continue }
+                let game: AnnotatedPGNGame
+                do {
+                    game = try chunk.annotatedGame()
+                } catch {
+                    let failure = GameReadError(gameNumber: gameNumber, byteOffset: chunk.startByteOffset,
+                                                reason: String(describing: error))
+                    skipped.append(failure)
+                    if engine.options.onInvalidGame(failure) == .abort {
+                        throw CQLError(.input, "cannot read PGN \(failure)")
+                    }
+                    continue
+                }
+                try process(GameTree(game: game, gameNumber: gameNumber, byteOffset: chunk.startByteOffset))
+            }
+        }
+
+        mutating func process(_ game: GameTree) throws(CQLError) {
+            if let gameRange, !gameRange.contains(game.gameNumber) { return }
+            if let result = engine.program.header.result, game.tags["Result"] != result { return }
+            if let issue = game.source.issues.first {
+                partial.append(GameReadError(gameNumber: game.gameNumber, byteOffset: game.byteOffset,
+                                             reason: "stopped at \(issue); later moves were ignored"))
+            }
             examined += 1
-            if let match = try evaluateGame(game, countRange: countRange) { matches.append(match) }
+            if let match = try engine.evaluateGame(game, countRange: countRange) { matches.append(match) }
         }
-        if !sortKeys.isEmpty || header.sortByMatchCount {
-            matches = sorted(matches)
+
+        func finish() -> CQLResult {
+            var output = matches
+            if !engine.sortKeys.isEmpty || engine.program.header.sortByMatchCount {
+                output = engine.sorted(output)
+            }
+            let evaluator = engine.evaluator
+            let persistent = evaluator.persistentVariables
+                .filter { !$0.value }
+                .compactMap { name, _ in evaluator.variables[name].map { (name: name, value: $0) } }
+                .sorted { $0.name < $1.name }
+            return CQLResult(matches: output, gamesExamined: examined, skippedGames: skipped,
+                             partiallyReadGames: partial, persistentVariables: persistent)
         }
-        let persistent = evaluator.persistentVariables
-            .filter { !$0.value }
-            .compactMap { name, _ in evaluator.variables[name].map { (name: name, value: $0) } }
-            .sorted { $0.name < $1.name }
-        return CQLResult(matches: matches, gamesExamined: examined, persistentVariables: persistent)
     }
 
     /// Matches a single game. Returns `nil` if the game does not match.
@@ -111,7 +228,7 @@ public final class CQLEngine {
         try withLargeStack { () throws(CQLError) -> GameMatch? in try self.evaluateGame(game, countRange: countRange) }
     }
 
-    private func evaluateGame(_ game: GameTree, countRange: ClosedRange<Int>?) throws(CQLError) -> GameMatch? {
+    fileprivate func evaluateGame(_ game: GameTree, countRange: ClosedRange<Int>?) throws(CQLError) -> GameMatch? {
         evaluator.begin(game: game)
         var matched: [PositionNode] = []
         for position in evaluator.visiblePositions where try evaluator.matches(at: position) {
@@ -190,7 +307,7 @@ public final class CQLEngine {
         }
     }
 
-    private func sorted(_ matches: [GameMatch]) -> [GameMatch] {
+    fileprivate func sorted(_ matches: [GameMatch]) -> [GameMatch] {
         let indexed = Array(matches.enumerated())
         return indexed.sorted { lhs, rhs in
             if program.header.sortByMatchCount, lhs.element.matchCount != rhs.element.matchCount {

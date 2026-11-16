@@ -1,4 +1,5 @@
 import FischerCore
+import Foundation
 
 /// Information about the move that led to a position.
 public struct MoveInfo: Hashable, Sendable {
@@ -119,10 +120,13 @@ public final class GameTree: @unchecked Sendable {
     public let source: AnnotatedPGNGame
     /// 1-based index of the game in its input.
     public let gameNumber: Int
+    /// Byte offset where the game starts in its input (0 when unknown).
+    public let byteOffset: Int64
 
-    public init(game: AnnotatedPGNGame, gameNumber: Int) {
+    public init(game: AnnotatedPGNGame, gameNumber: Int, byteOffset: Int64 = 0) {
         self.source = game
         self.gameNumber = gameNumber
+        self.byteOffset = byteOffset
         var tags: [String: String] = [:]
         for (tag, value) in game.tags { tags[tag.rawValue] = value }
         self.tags = tags
@@ -166,10 +170,30 @@ public final class GameTree: @unchecked Sendable {
         Square.allCases.map { game.pieceID(at: $0)?.rawValue }
     }
 
-    /// Reads every game in a PGN string.
+    /// Reads every game in a PGN string, throwing on the first game that
+    /// cannot be read. Use ``read(pgn:)`` to skip unreadable games instead.
     public static func games(fromPGN text: String) throws -> [GameTree] {
-        let games = try PGNReader().parseAnnotated(text)
-        return games.enumerated().map { GameTree(game: $0.element, gameNumber: $0.offset + 1) }
+        let (games, errors) = read(pgn: text)
+        if let first = errors.first { throw first }
+        return games
+    }
+
+    /// Reads every game in a PGN string, collecting the games that cannot be
+    /// read instead of stopping at the first one. Game numbers keep their
+    /// position in the input.
+    public static func read(pgn text: String) -> (games: [GameTree], errors: [GameReadError]) {
+        var games: [GameTree] = []
+        var errors: [GameReadError] = []
+        for chunk in PGNGameSplitter.chunks(in: Data(text.utf8)) {
+            do {
+                games.append(GameTree(game: try chunk.annotatedGame(), gameNumber: chunk.index + 1,
+                                      byteOffset: chunk.startByteOffset))
+            } catch {
+                errors.append(GameReadError(gameNumber: chunk.index + 1, byteOffset: chunk.startByteOffset,
+                                            reason: String(describing: error)))
+            }
+        }
+        return (games, errors)
     }
 
     public var mainline: [PositionNode] {
