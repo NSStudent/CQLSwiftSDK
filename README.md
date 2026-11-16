@@ -5,7 +5,7 @@ A Swift package (SPM) that parses and runs **CQL 6.2** ([Chess Query Language](h
 ## Installation
 
 ```swift
-.package(url: "https://github.com/NSStudent/CQLSwiftSDK.git", from: "0.1.1")
+.package(url: "https://github.com/NSStudent/CQLSwiftSDK.git", from: "0.2.0")
 ```
 
 Then add `.product(name: "CQL", package: "CQLSwiftSDK")` to your target's dependencies. Requires Swift 6.0 or later, macOS 13 or iOS 16.
@@ -52,6 +52,39 @@ options.onInvalidGame = { error in
 }
 let result = try CQLEngine(source: source, options: options).run(contentsOf: pgnURL)
 ```
+
+### Evaluating games without PGN
+
+Games that are already decoded can be tested directly, without producing PGN text:
+
+```swift
+let tree = try GameTree(moves: resolvedMoves, startingFEN: nil,
+                        tags: ["White": "Tal, Mikhail", "Date": "1960.03.15", "Result": "1-0"])
+if let match = try engine.evaluate(game: tree) {
+    print(match.matchedPositions)   // positionids (ply numbers on the mainline)
+}
+```
+
+`GameTree(game:)` accepts a FischerCore `Game`. `GameMatch.annotatedPGN` is only built when it is read.
+
+### Pre-filtering with necessary conditions
+
+`CQLPlan.necessaryConditions(of:)` (or `program.necessaryConditions`) extracts from the top-level conjunction of a program the conditions every matching game must meet, so that an index can discard games before CQL runs:
+
+- position conditions that must hold together at one position: piece counts per designator (`Pd4` → at least one, `not P[c2-7]` → none, `4 ≤ ♙ < 7` → 4…6), side to move, `fen` placements;
+- game conditions: tag substrings (`player "Tal"`), Elo ranges, year range, result, game number range.
+
+`isExact` tells whether the conditions are equivalent to the program; `untranslated` lists the parts that are not. The AST (`Filter`) is public; `subfilters` and `contains(where:)` walk it.
+
+```swift
+let conditions = try Parser.parse("cql() Pd4 and not P[c2-7,e2-7] and not [Pp][c2-7,d5-7]").necessaryConditions
+conditions.isExact                     // true
+conditions.position.pieces[0].count    // 1...64
+```
+
+### Threads
+
+A `CQLEngine` (and its `Evaluator`) is not thread-safe: use one engine per thread. A `GameTree` caches legal moves lazily, so do not evaluate the same tree from several threads at once. There is no other shared mutable state, so engines on different threads run independently.
 
 The API is layered:
 

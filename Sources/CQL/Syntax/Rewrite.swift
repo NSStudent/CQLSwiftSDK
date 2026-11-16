@@ -1,4 +1,20 @@
 extension Filter {
+    /// The direct child filters (arguments, operands, bodies, ⊢ constituents…).
+    public var subfilters: [Filter] {
+        var result: [Filter] = []
+        _ = try? mapChildren { (child) throws(CQLError) -> Filter in
+            result.append(child)
+            return child
+        }
+        return result
+    }
+
+    /// Whether this filter or any filter nested in it satisfies `predicate`.
+    public func contains(where predicate: (Filter) -> Bool) -> Bool {
+        if predicate(self) { return true }
+        return subfilters.contains { $0.contains(where: predicate) }
+    }
+
     /// Returns a copy with `transform` applied to every direct child filter.
     func mapChildren(_ transform: (Filter) throws(CQLError) -> Filter) throws(CQLError) -> Filter {
         func opt(_ filter: Filter?) throws(CQLError) -> Filter? {

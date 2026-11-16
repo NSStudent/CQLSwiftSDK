@@ -12,9 +12,50 @@ public struct GameMatch: Sendable {
     public let comments: [GeneratedComment]
     /// Best value of each `sort` filter (keyed by documentation string).
     public let sortValues: [(key: String, value: Value)]
-    /// The game annotated with CQL comments, as PGN text.
-    public let annotatedPGN: String
     public let game: GameTree
+    let annotation: Annotation
+
+    /// The game annotated with CQL comments, as PGN text. Built on demand, so
+    /// callers that only need to know whether a game matches pay nothing for it.
+    public var annotatedPGN: String { annotation.render(game) }
+}
+
+/// The edits CQL makes to a matching game's PGN output.
+struct Annotation: Sendable {
+    var removedCommentPaths: [[Int]] = []
+    var tagEdits: [String: String] = [:]
+    var headerComment: String?
+    var comments: [GeneratedComment] = []
+    var matchPaths: [[Int]] = []
+    var matchString = "CQL"
+
+    func render(_ tree: GameTree) -> String {
+        var game = tree.source
+        func add(_ text: String, at path: [Int]) {
+            guard !text.isEmpty else { return }
+            if path.isEmpty {
+                game.tree.initialAnnotations.comments.append(text)
+            } else {
+                _ = game.tree.updateAnnotations(at: MovePath(path)) { $0.comments.append(text) }
+            }
+        }
+        for path in removedCommentPaths {
+            if path.isEmpty {
+                game.tree.initialAnnotations.comments = []
+            } else {
+                _ = game.tree.updateAnnotations(at: MovePath(path)) { $0.comments = [] }
+            }
+        }
+        for (name, value) in tagEdits.sorted(by: { $0.key < $1.key }) {
+            guard let tag = PGNTag(rawValue: name) else { continue }
+            if game.tags[tag] == nil { game.tagOrder.append(tag) }
+            game.tags[tag] = value
+        }
+        if let headerComment { add(headerComment, at: []) }
+        for comment in comments { add(comment.text, at: comment.path) }
+        for path in matchPaths { add(matchString, at: path) }
+        return game.pgn()
+    }
 }
 
 /// A game that could not be read from the PGN input.
@@ -86,6 +127,8 @@ public final class CQLEngine {
     public let options: Options
     public let evaluator: Evaluator
     fileprivate let sortKeys: [(key: String, minimum: Bool)]
+    /// Whether evaluation can recurse deeply (the program has a ⊢ filter).
+    private let needsLargeStack: Bool
 
     public init(program: CQLProgram, options: Options = Options()) throws(CQLError) {
         self.program = program
@@ -94,6 +137,7 @@ public final class CQLEngine {
         var keys: [(String, Bool)] = []
         Self.collectSortKeys(evaluator.body, into: &keys)
         self.sortKeys = keys
+        self.needsLargeStack = evaluator.body.contains(where: { if case .path = $0 { true } else { false } })
     }
 
     /// Parses `source` and creates an engine for it.
@@ -200,7 +244,7 @@ public final class CQLEngine {
         mutating func process(_ game: GameTree) throws(CQLError) {
             if let gameRange, !gameRange.contains(game.gameNumber) { return }
             if let result = engine.program.header.result, game.tags["Result"] != result { return }
-            if let issue = game.source.issues.first {
+            if let issue = game.readIssues.first {
                 partial.append(GameReadError(gameNumber: game.gameNumber, byteOffset: game.byteOffset,
                                              reason: "stopped at \(issue); later moves were ignored"))
             }
@@ -224,8 +268,16 @@ public final class CQLEngine {
     }
 
     /// Matches a single game. Returns `nil` if the game does not match.
+    ///
+    /// Use it to test games that are already decoded (``GameTree/init(moves:startingFEN:tags:gameNumber:)``)
+    /// without producing PGN text. A large stack is only set up when the
+    /// program contains a ⊢ filter, whose matching is recursive.
+    ///
+    /// Not safe to call concurrently on the same engine. Use one engine per
+    /// thread, and do not share a ``GameTree`` between threads.
     public func evaluate(game: GameTree, countRange: ClosedRange<Int>? = nil) throws(CQLError) -> GameMatch? {
-        try withLargeStack { () throws(CQLError) -> GameMatch? in try self.evaluateGame(game, countRange: countRange) }
+        guard needsLargeStack else { return try evaluateGame(game, countRange: countRange) }
+        return try withLargeStack { () throws(CQLError) -> GameMatch? in try self.evaluateGame(game, countRange: countRange) }
     }
 
     fileprivate func evaluateGame(_ game: GameTree, countRange: ClosedRange<Int>?) throws(CQLError) -> GameMatch? {
@@ -240,58 +292,32 @@ public final class CQLEngine {
         let sortValues = sortKeys.compactMap { key, _ in evaluator.sortValues[key].map { (key: key, value: $0.value) } }
         return GameMatch(gameNumber: game.gameNumber, matchCount: matched.count,
                          matchedPositions: matched.map(\.id), comments: evaluator.comments,
-                         sortValues: sortValues,
-                         annotatedPGN: annotate(game, matched: matched),
-                         game: game)
+                         sortValues: sortValues, game: game,
+                         annotation: annotation(for: game, matched: matched))
     }
 
     // MARK: - Output
 
-    private func annotate(_ tree: GameTree, matched: [PositionNode]) -> String {
-        var game = tree.source
+    private func annotation(for tree: GameTree, matched: [PositionNode]) -> Annotation {
         let silent = options.silent ?? program.header.silent
         let quiet = options.quiet ?? program.header.quiet
-        let matchString = options.matchString ?? program.header.matchString ?? "CQL"
-
-        func add(_ text: String, at path: [Int]) {
-            guard !text.isEmpty else { return }
-            if path.isEmpty {
-                game.tree.initialAnnotations.comments.append(text)
-            } else {
-                _ = game.tree.updateAnnotations(at: MovePath(path)) { $0.comments.append(text) }
-            }
+        var annotation = Annotation()
+        annotation.matchString = options.matchString ?? program.header.matchString ?? "CQL"
+        annotation.removedCommentPaths = evaluator.removedComments.compactMap { id in
+            tree.nodes.first(where: { $0.id == id })?.path
         }
-
-        for id in evaluator.removedComments {
-            guard let node = tree.nodes.first(where: { $0.id == id }) else { continue }
-            if node.path.isEmpty {
-                game.tree.initialAnnotations.comments = []
-            } else {
-                _ = game.tree.updateAnnotations(at: MovePath(node.path)) { $0.comments = [] }
+        annotation.tagEdits = evaluator.tagEdits
+        guard !silent else { return annotation }
+        if options.headerComments {
+            var header = "Game number \(tree.gameNumber)"
+            for (_, value) in sortKeys.compactMap({ key, _ in evaluator.sortValues[key].map { (key, $0) } }) {
+                header += "; \(value.documentation ?? "sort") \(value.value)"
             }
+            annotation.headerComment = header
         }
-        for (name, value) in evaluator.tagEdits {
-            if let tag = PGNTag(rawValue: name) {
-                if game.tags[tag] == nil { game.tagOrder.append(tag) }
-                game.tags[tag] = value
-            }
-        }
-
-        if !silent {
-            if options.headerComments {
-                var header = "Game number \(tree.gameNumber)"
-                for (key, value) in sortKeys.compactMap({ key, _ in evaluator.sortValues[key].map { (key, $0) } }) {
-                    header += "; \(value.documentation ?? "sort") \(value.value)"
-                    _ = key
-                }
-                add(header, at: [])
-            }
-            for comment in evaluator.comments { add(comment.text, at: comment.path) }
-            if !quiet {
-                for node in matched { add(matchString, at: node.path) }
-            }
-        }
-        return game.pgn()
+        annotation.comments = evaluator.comments
+        if !quiet { annotation.matchPaths = matched.map(\.path) }
+        return annotation
     }
 
     // MARK: - Sorting

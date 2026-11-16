@@ -23,7 +23,8 @@ public final class Evaluator {
     var persistentVariables: [String: Bool] = [:]  // name → quiet
     var dictionaries: [String: CQLDictionary] = [:]
     var captures: [(text: String, index: Int)?] = []
-    var comments: [GeneratedComment] = []
+    /// Comments generated so far in the current game (by `comment`, `///`, ⊢ annotations…).
+    public internal(set) var comments: [GeneratedComment] = []
     var tagEdits: [String: String] = [:]
     var removedComments: Set<Int> = []
     /// Best value per sort key for the current game.

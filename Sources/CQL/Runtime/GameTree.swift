@@ -110,23 +110,52 @@ public final class PositionNode: @unchecked Sendable {
     }
 }
 
-/// A game read from PGN, expanded into a tree of positions.
+/// A game expanded into a tree of positions.
+///
+/// Built from PGN (``init(game:gameNumber:byteOffset:)``, ``read(pgn:)``) or
+/// directly from moves (``init(moves:startingFEN:tags:gameNumber:)``,
+/// ``init(game:tags:gameNumber:)``), which avoids producing and parsing PGN text.
 public final class GameTree: @unchecked Sendable {
     public let root: PositionNode
     /// All nodes in PGN order (a move, then the variations branching from
     /// before it, then the continuation).
     public let nodes: [PositionNode]
     public let tags: [String: String]
-    public let source: AnnotatedPGNGame
     /// 1-based index of the game in its input.
     public let gameNumber: Int
     /// Byte offset where the game starts in its input (0 when unknown).
     public let byteOffset: Int64
+    /// Problems met while reading the PGN (moves from the first one on were ignored).
+    public let readIssues: [String]
 
+    private enum Origin {
+        case pgn(AnnotatedPGNGame)
+        case moves(start: Game, moves: [ResolvedMove])
+    }
+
+    private let origin: Origin
+
+    /// The game as an annotated PGN game. For games built from moves it is
+    /// created on demand (only PGN output needs it).
+    public var source: AnnotatedPGNGame {
+        switch origin {
+        case .pgn(let game):
+            return game
+        case .moves(let start, let moves):
+            var game = start
+            for move in moves { _ = try? game.execute(resolvedMove: move, considerHalfmoves: false) }
+            var pgnTags: [PGNTag: String] = [:]
+            for (name, value) in tags { if let tag = PGNTag(rawValue: name) { pgnTags[tag] = value } }
+            return AnnotatedPGNGame(game: game, tags: pgnTags)
+        }
+    }
+
+    /// Builds the tree of a game read from PGN, with its variations and comments.
     public init(game: AnnotatedPGNGame, gameNumber: Int, byteOffset: Int64 = 0) {
-        self.source = game
+        self.origin = .pgn(game)
         self.gameNumber = gameNumber
         self.byteOffset = byteOffset
+        self.readIssues = game.issues.map(\.description)
         var tags: [String: String] = [:]
         for (tag, value) in game.tags { tags[tag.rawValue] = value }
         self.tags = tags
@@ -152,12 +181,74 @@ public final class GameTree: @unchecked Sendable {
             }
         }
         self.root = root
-        self.nodes = PositionNode.pgnOrder(from: root) { $0.children }
+        self.nodes = Self.numbered(root)
+    }
 
-        // positionid: mainline by ply, then variation positions in PGN order.
+    /// Builds the tree of a single line of moves, without going through PGN.
+    ///
+    /// - Parameters:
+    ///   - moves: The moves of the game, in order.
+    ///   - startingFEN: The initial position; `nil` for the standard start.
+    ///   - tags: PGN tag values by name (`"White"`, `"Date"`, `"Result"`…), used by tag filters.
+    /// - Throws: ``GameReadError`` if the FEN is invalid or a move is illegal.
+    public init(moves: [ResolvedMove], startingFEN: String? = nil, tags: [String: String] = [:],
+                gameNumber: Int = 1) throws(GameReadError) {
+        let start: Game
+        if let startingFEN {
+            do {
+                start = try Game(with: startingFEN)
+            } catch {
+                throw GameReadError(gameNumber: gameNumber, byteOffset: 0, reason: "invalid FEN \(startingFEN): \(error)")
+            }
+        } else {
+            start = Game()
+        }
+        self.origin = .moves(start: start, moves: moves)
+        self.gameNumber = gameNumber
+        self.byteOffset = 0
+        self.readIssues = []
+        self.tags = tags
+
+        let root = PositionNode(parent: nil, childIndex: 0, board: BoardState(game: start), move: nil,
+                                pieceIDs: Self.pieceIDs(start), comments: [], nags: [], moveNumber: Int(start.fullmoves))
+        var parent = root
+        var game = start
+        for (index, move) in moves.enumerated() {
+            let info = MoveInfo(board: parent.board, resolved: move)
+            do {
+                try game.execute(resolvedMove: move, considerHalfmoves: false)
+            } catch {
+                throw GameReadError(gameNumber: gameNumber, byteOffset: 0,
+                                    reason: "illegal move \(move.move) at ply \(index + 1)")
+            }
+            let node = PositionNode(parent: parent, childIndex: 0, board: BoardState(game: game), move: info,
+                                    pieceIDs: Self.pieceIDs(game), comments: [], nags: [], moveNumber: Int(game.fullmoves))
+            parent.children.append(node)
+            parent = node
+        }
+        self.root = root
+        self.nodes = Self.numbered(root)
+    }
+
+    /// Builds the tree of a FischerCore game's move history.
+    public convenience init(game: Game, tags: [String: String] = [:], gameNumber: Int = 1) throws(GameReadError) {
+        let moves = game.moveHistory.map { ResolvedMove(move: $0.move, promotion: $0.promotionPiece) }
+        var allTags = tags
+        if allTags["White"] == nil, !game.whitePlayer.isEmpty { allTags["White"] = game.whitePlayer }
+        if allTags["Black"] == nil, !game.blackPlayer.isEmpty { allTags["Black"] = game.blackPlayer }
+        let standard = Game().initialFen
+        try self.init(moves: moves, startingFEN: game.initialFen == standard ? nil : game.initialFen,
+                      tags: allTags, gameNumber: gameNumber)
+    }
+
+    /// Orders the nodes in PGN order and assigns `positionid`s: mainline
+    /// positions by ply, then variation positions in PGN order.
+    private static func numbered(_ root: PositionNode) -> [PositionNode] {
+        let nodes = PositionNode.pgnOrder(from: root) { $0.children }
         var nextID = 0
         for node in nodes where node.isMainline { node.id = node.ply; nextID = max(nextID, node.ply + 1) }
         for node in nodes where !node.isMainline { node.id = nextID; nextID += 1 }
+        return nodes
     }
 
     deinit {

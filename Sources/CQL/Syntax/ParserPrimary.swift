@@ -50,7 +50,7 @@ extension Parser {
         "piecepath",
     ]
 
-    static var reservedWords: Set<String> {
+    static let reservedWords: Set<String> = {
         var words = Set(simpleKeywords.keys).union(prefixFilters.keys).union(directionNames).union(unsupportedFilters)
         words.formUnion([
             "and", "or", "not", "in", "if", "then", "else", "while", "loop", "square", "piece", "all", "find",
@@ -63,7 +63,7 @@ extension Parser {
         ])
         words.formUnion(TransformKind.allCases.map(\.rawValue))
         return words
-    }
+    }()
 
     // MARK: - Primary
 
