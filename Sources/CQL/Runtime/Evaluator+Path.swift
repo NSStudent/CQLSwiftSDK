@@ -46,7 +46,7 @@ extension Evaluator {
 
         var focus: Set<Int>?
         if let focusFilter = path.focus {
-            focus = Set(try evaluateSet(focusFilter).compactMap { start.pieceIDs[$0] })
+            focus = Set(try evaluateSet(focusFilter).compactMap { start.pieceID(at: $0) })
         }
         let search = Search(path: path, start: start, focus: focus, commentMark: comments.count)
         let savedAtomics = atomicSnapshot()
@@ -175,9 +175,9 @@ extension Evaluator {
 
     private func isInFocus(_ move: MoveInfo, head: PositionNode, _ search: Search) -> Bool {
         guard let focus = search.focus else { return true }
-        if let id = head.pieceIDs[move.from], focus.contains(id) { return true }
-        if let rook = move.castlingRook, let id = head.pieceIDs[rook.from], focus.contains(id) { return true }
-        if search.path.focusCapture, let square = move.captureSquare, let id = head.pieceIDs[square], focus.contains(id) {
+        if let id = head.pieceID(at: move.from), focus.contains(id) { return true }
+        if let rook = move.castlingRook, let id = head.pieceID(at: rook.from), focus.contains(id) { return true }
+        if search.path.focusCapture, let square = move.captureSquare, let id = head.pieceID(at: square), focus.contains(id) {
             return true
         }
         return false
@@ -230,9 +230,9 @@ extension Evaluator {
     }
 
     private func isFocused(_ move: MoveInfo, head: PositionNode, _ focus: Set<Int>, capture: Bool) -> Bool {
-        if let id = head.pieceIDs[move.from], focus.contains(id) { return true }
-        if let rook = move.castlingRook, let id = head.pieceIDs[rook.from], focus.contains(id) { return true }
-        if capture, let square = move.captureSquare, let id = head.pieceIDs[square], focus.contains(id) { return true }
+        if let id = head.pieceID(at: move.from), focus.contains(id) { return true }
+        if let rook = move.castlingRook, let id = head.pieceID(at: rook.from), focus.contains(id) { return true }
+        if capture, let square = move.captureSquare, let id = head.pieceID(at: square), focus.contains(id) { return true }
         return false
     }
 

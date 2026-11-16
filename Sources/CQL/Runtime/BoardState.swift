@@ -188,16 +188,36 @@ public struct BoardState: Hashable, Sendable {
 
     /// Pieces (of any colour) that attack `square`.
     public func attackers(of square: Int) -> SquareSet {
+        attackers(of: square, by: .white) | attackers(of: square, by: .black)
+    }
+
+    /// Pieces of `color` that attack `square`, found by looking outward from
+    /// the square (knight, king and pawn tables, then the four sliding lines).
+    public func attackers(of square: Int, by color: CQLColor) -> SquareSet {
+        var result = Attacks.knightTable[square] & squares(of: CQLPiece(.knight, color))
+        result |= Attacks.kingTable[square] & squares(of: CQLPiece(.king, color))
+        // A pawn of `color` attacks `square` from where a pawn of the other
+        // colour standing on `square` would attack.
+        result |= Attacks.pawnAttackTable[color.opposite.rawValue][square] & squares(of: CQLPiece(.pawn, color))
+        let queens = squares(of: CQLPiece(.queen, color))
+        let straight = squares(of: CQLPiece(.rook, color)) | queens
+        let diagonal = squares(of: CQLPiece(.bishop, color)) | queens
         let occupied = self.occupied
-        var result = SquareSet()
-        for from in occupied where Attacks.attacks(of: piece(at: from)!, from: from, occupied: occupied).contains(square) {
-            result.insert(from)
+        if !straight.isEmpty {
+            for direction in BoardDirection.orthogonal {
+                result |= Attacks.ray(from: square, direction, occupied: occupied) & straight
+            }
+        }
+        if !diagonal.isEmpty {
+            for direction in BoardDirection.diagonal {
+                result |= Attacks.ray(from: square, direction, occupied: occupied) & diagonal
+            }
         }
         return result
     }
 
     public func isAttacked(_ square: Int, by color: CQLColor) -> Bool {
-        !(attackers(of: square) & squares(ofColor: color)).isEmpty
+        !attackers(of: square, by: color).isEmpty
     }
 
     public func isInCheck(_ color: CQLColor) -> Bool {

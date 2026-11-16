@@ -102,7 +102,7 @@ extension Evaluator {
         // Pieces are identified in the current position (the tail of the move).
         func focused(_ square: Int) -> Bool {
             guard let focus = scope.focus else { return true }
-            return current.pieceIDs[square].map(focus.contains) ?? false
+            return current.pieceID(at: square).map(focus.contains) ?? false
         }
         var result = SquareSet()
         if scope.left.contains(move.from), scope.right.contains(move.to), focused(move.to) {

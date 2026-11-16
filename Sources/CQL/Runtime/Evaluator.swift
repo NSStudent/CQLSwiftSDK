@@ -224,7 +224,7 @@ public final class Evaluator {
             return try assign(name, op, value)
         case .pieceAssign(let name, let value):
             let set = try evaluateSet(value)
-            guard let square = set.single, let id = current.pieceIDs[square] else { return nil }
+            guard let square = set.single, let id = current.pieceID(at: square) else { return nil }
             variables[name] = .piece(PieceIdentity(id: id))
             return .matched
         case .subscriptAssign(let name, let key, let end, let isSlice, let value):
@@ -507,7 +507,7 @@ public final class Evaluator {
         var result = SquareSet()
         for square in squares {
             if isPiece {
-                guard let id = current.pieceIDs[square] else { continue }
+                guard let id = current.pieceID(at: square) else { continue }
                 variables[variable] = .piece(PieceIdentity(id: id))
             } else {
                 variables[variable] = .set(SquareSet(index: square))

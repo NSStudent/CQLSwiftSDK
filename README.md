@@ -5,7 +5,7 @@ A Swift package (SPM) that parses and runs **CQL 6.2** ([Chess Query Language](h
 ## Installation
 
 ```swift
-.package(url: "https://github.com/NSStudent/CQLSwiftSDK.git", from: "0.2.0")
+.package(url: "https://github.com/NSStudent/CQLSwiftSDK.git", from: "0.2.1")
 ```
 
 Then add `.product(name: "CQL", package: "CQLSwiftSDK")` to your target's dependencies. Requires Swift 6.0 or later, macOS 13 or iOS 16.
@@ -85,6 +85,18 @@ conditions.position.pieces[0].count    // 1...64
 ### Threads
 
 A `CQLEngine` (and its `Evaluator`) is not thread-safe: use one engine per thread. A `GameTree` caches legal moves lazily, so do not evaluate the same tree from several threads at once. There is no other shared mutable state, so engines on different threads run independently.
+
+### Performance
+
+Measured on an Apple M2 Pro (Release build) with the first 20,000 games of a real database, one `CQLEngine` per thread:
+
+| Work per run (20,000 games) | 1 thread | 6 threads |
+|---|---|---|
+| Read PGN, build trees, evaluate | 8.8–9.3 s | 2.6–2.9 s |
+| Build trees from decoded moves (`GameTree(moves:)`), evaluate | 2.0–2.6 s | 0.6–0.7 s |
+| Evaluate trees that are already built | 0.5–1.1 s | 0.1–0.3 s |
+
+Queries: `mate`, an isolated queen pawn (`Pd4 and not P[c2-7,e2-7] and not [Pp][c2-7,d5-7]`) and `pin from R`. Most of the time is spent reading PGN and building position trees, not evaluating CQL. Results are identical for every thread count.
 
 The API is layered:
 

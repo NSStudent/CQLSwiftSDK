@@ -35,4 +35,31 @@ struct StressTests {
         }
         #expect(elapsed < .seconds(20))
     }
+
+    /// The incremental tree builder must agree with FischerCore's replay at
+    /// every position: placement, side to move, castling, en passant and
+    /// piece identities.
+    @Test(arguments: [1, 2, 3, 4, 5, 6] as [UInt64])
+    func incrementalTreesMatchFischerCore(seed: UInt64) throws {
+        let pgn = try Self.randomGamePGN(plies: 400, seed: seed)
+        let tree = try #require(try GameTree.games(fromPGN: pgn).first)
+        var game = tree.source.tree.initialGame
+        var node = tree.root
+        let moves = tree.source.tree.mainline.map(\.node.move)
+        #expect(tree.mainline.count == moves.count + 1)
+        for move in moves {
+            try game.execute(resolvedMove: move, considerHalfmoves: false)
+            node = try #require(node.children.first)
+            let expected = BoardState(game: game)
+            #expect(node.board.pieceSets == expected.pieceSets, "ply \(node.ply)")
+            #expect(node.board.sideToMove == expected.sideToMove)
+            #expect(node.board.castling == expected.castling, "ply \(node.ply)")
+            #expect(node.board.enPassantTarget == expected.enPassantTarget, "ply \(node.ply)")
+            #expect(node.pieceIDs == Square.allCases.map { game.pieceID(at: $0)?.rawValue }, "ply \(node.ply)")
+            #expect(node.moveNumber == Int(game.fullmoves))
+        }
+        // Built from the same moves directly, the tree is identical.
+        let direct = try GameTree(moves: moves)
+        #expect(direct.mainline.map(\.board) == tree.mainline.map(\.board))
+    }
 }

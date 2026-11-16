@@ -208,7 +208,7 @@ extension Evaluator {
                 return .number((piece.kind.rawValue + 1) * (piece.color == .white ? 1 : -1))
             case "typename": return .string(piece.map { String($0.kind.asciiLetter) } ?? "_")
             case "piecename": return .string(piece.map { String($0.asciiLetter) } ?? "_")
-            case "pieceid": return current.pieceIDs[square].map(Value.number)
+            case "pieceid": return current.pieceID(at: square).map(Value.number)
             default: throw runtimeError("unknown filter \(name)")
             }
         }

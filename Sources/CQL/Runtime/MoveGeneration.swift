@@ -137,6 +137,81 @@ extension BoardState {
         return moves
     }
 
+    /// Plays `from`→`to` if it is a legal move here, returning the move and
+    /// the resulting position; `nil` if it is not legal.
+    ///
+    /// Castling is given as the king's move (e1→g1); the "king takes rook"
+    /// form (e1→h1) is accepted too. `promotion` is required exactly when a
+    /// pawn reaches the last rank.
+    func play(from: Int, to target: Int, promotion: CQLPieceKind?) -> (MoveInfo, BoardState)? {
+        guard let piece = piece(at: from), piece.color == sideToMove, from != target else { return nil }
+        let us = sideToMove
+        let own = squares(ofColor: us)
+        let occupied = self.occupied
+        var to = target
+        var castlingSide: MoveInfo.CastlingSide?
+
+        if piece.kind == .king, from / 8 == to / 8, from == (us == .white ? 4 : 60),
+           abs(to - from) == 2 || squares(of: CQLPiece(.rook, us)).contains(to) && (to % 8 == 0 || to % 8 == 7) {
+            // Castling, possibly written as the king capturing its own rook.
+            let side: MoveInfo.CastlingSide = to > from ? .kingside : .queenside
+            let rank = from / 8
+            let right: CastlingSet = us == .white
+                ? (side == .kingside ? .whiteKingside : .whiteQueenside)
+                : (side == .kingside ? .blackKingside : .blackQueenside)
+            let rookSquare = side == .kingside ? rank * 8 + 7 : rank * 8
+            let empty = side == .kingside ? [rank * 8 + 5, rank * 8 + 6] : [rank * 8 + 1, rank * 8 + 2, rank * 8 + 3]
+            let path = side == .kingside ? [from, rank * 8 + 5, rank * 8 + 6] : [from, rank * 8 + 3, rank * 8 + 2]
+            guard castling.contains(right), squares(of: CQLPiece(.rook, us)).contains(rookSquare),
+                  empty.allSatisfy({ !occupied.contains($0) }),
+                  path.allSatisfy({ !isAttacked($0, by: us.opposite) }) else { return nil }
+            to = side == .kingside ? rank * 8 + 6 : rank * 8 + 2
+            castlingSide = side
+        } else if own.contains(to) {
+            return nil
+        }
+
+        var captured = self.piece(at: to)
+        var captureSquare: Int? = captured == nil ? nil : to
+        var isEnPassant = false
+        if castlingSide == nil {
+            switch piece.kind {
+            case .pawn:
+                let forward = us == .white ? 8 : -8
+                let startRank = us == .white ? 1 : 6
+                if to == from + forward {
+                    guard captured == nil else { return nil }
+                } else if to == from + 2 * forward {
+                    guard from / 8 == startRank, captured == nil, !occupied.contains(from + forward) else { return nil }
+                } else if Attacks.pawnAttackTable[us.rawValue][from].contains(to) {
+                    if captured == nil {
+                        guard to == enPassantTarget else { return nil }
+                        isEnPassant = true
+                        captureSquare = (from / 8) * 8 + to % 8
+                        captured = CQLPiece(.pawn, us.opposite)
+                    }
+                } else {
+                    return nil
+                }
+                let lastRank = us == .white ? 7 : 0
+                if to / 8 == lastRank {
+                    guard let promotion, [.queen, .rook, .bishop, .knight].contains(promotion) else { return nil }
+                } else if promotion != nil {
+                    return nil
+                }
+            default:
+                guard Attacks.attacks(of: piece, from: from, occupied: occupied).contains(to) else { return nil }
+            }
+        }
+
+        let move = MoveInfo(from: from, to: to, piece: piece, captured: captured, captureSquare: captureSquare,
+                            promotion: piece.kind == .pawn ? promotion : nil, isEnPassant: isEnPassant,
+                            castling: castlingSide, isNull: false)
+        let next = applying(move)
+        guard !next.isInCheck(us) else { return nil }
+        return (move, next)
+    }
+
     func legalMoves() -> [MoveInfo] {
         pseudolegalMoves().filter { !applying($0).isInCheck(sideToMove) }
     }

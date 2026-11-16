@@ -31,8 +31,19 @@ public final class PositionNode: @unchecked Sendable {
     public let board: BoardState
     /// The move that led to this position (`nil` for the initial position).
     public let move: MoveInfo?
+    /// Identity of the piece on each square, -1 for empty squares.
+    let ids: [Int8]
+
     /// Stable identity of the piece on each square (`nil` for empty squares).
-    public let pieceIDs: [Int?]
+    /// Pieces are numbered 0, 1, 2… in square order (a1, b1, … h8) in the
+    /// initial position and keep their number as they move or promote.
+    public var pieceIDs: [Int?] { ids.map { $0 < 0 ? nil : Int($0) } }
+
+    /// The identity of the piece on `square`, if any.
+    public func pieceID(at square: Int) -> Int? {
+        let id = ids[square]
+        return id < 0 ? nil : Int(id)
+    }
     /// Comments present in the input PGN after the move leading here.
     public let originalComments: [String]
     /// NAG codes attached to the move leading here.
@@ -42,7 +53,7 @@ public final class PositionNode: @unchecked Sendable {
     /// Path in the FischerCore annotated move tree.
     public let path: [Int]
 
-    init(parent: PositionNode?, childIndex: Int, board: BoardState, move: MoveInfo?, pieceIDs: [Int?],
+    init(parent: PositionNode?, childIndex: Int, board: BoardState, move: MoveInfo?, ids: [Int8],
          comments: [String], nags: [Int], moveNumber: Int) {
         self.id = 0
         self.parent = parent
@@ -51,7 +62,7 @@ public final class PositionNode: @unchecked Sendable {
         self.depth = (parent?.depth ?? 0) + (parent != nil && childIndex > 0 ? 1 : 0)
         self.board = board
         self.move = move
-        self.pieceIDs = pieceIDs
+        self.ids = ids
         self.originalComments = comments
         self.nags = nags
         self.moveNumber = moveNumber
@@ -106,7 +117,38 @@ public final class PositionNode: @unchecked Sendable {
 
     /// The square of the piece with the given identity, if it is on the board.
     public func square(ofPiece id: Int) -> Int? {
-        pieceIDs.firstIndex(of: id)
+        guard let id = Int8(exactly: id), id >= 0 else { return nil }
+        return ids.firstIndex(of: id)
+    }
+
+    /// Initial piece identities: 0, 1, 2… in square order.
+    static func initialIDs(_ board: BoardState) -> [Int8] {
+        var ids = [Int8](repeating: -1, count: 64)
+        var next: Int8 = 0
+        let occupied = board.occupied
+        for square in 0..<64 where occupied.contains(square) {
+            ids[square] = next
+            next += 1
+        }
+        return ids
+    }
+
+    /// The position after playing `from`→`to` here, as a new child node
+    /// (not yet attached); `nil` if the move is illegal.
+    func child(from: Int, to: Int, promotion: CQLPieceKind?, index: Int,
+               comments: [String] = [], nags: [Int] = []) -> PositionNode? {
+        guard let (move, next) = board.play(from: from, to: to, promotion: promotion) else { return nil }
+        var ids = self.ids
+        if let captureSquare = move.captureSquare { ids[captureSquare] = -1 }
+        ids[move.to] = ids[move.from]
+        ids[move.from] = -1
+        if let rook = move.castlingRook {
+            ids[rook.to] = ids[rook.from]
+            ids[rook.from] = -1
+        }
+        let moveNumber = self.moveNumber + (board.sideToMove == .black ? 1 : 0)
+        return PositionNode(parent: self, childIndex: index, board: next, move: move, ids: ids,
+                            comments: comments, nags: nags, moveNumber: moveNumber)
     }
 }
 
@@ -161,23 +203,24 @@ public final class GameTree: @unchecked Sendable {
         self.tags = tags
 
         let start = game.tree.initialGame
-        let root = PositionNode(parent: nil, childIndex: 0, board: BoardState(game: start), move: nil,
-                                pieceIDs: Self.pieceIDs(start), comments: game.tree.initialAnnotations.comments,
+        let board = BoardState(game: start)
+        let root = PositionNode(parent: nil, childIndex: 0, board: board, move: nil,
+                                ids: PositionNode.initialIDs(board), comments: game.tree.initialAnnotations.comments,
                                 nags: [], moveNumber: Int(start.fullmoves))
 
-        // Built iteratively: games can be hundreds of plies long.
-        var work: [(PositionNode, Game, [AnnotatedMoveNode])] = [(root, start, game.tree.children)]
-        while let (parent, parentGame, children) = work.popLast() {
+        // Built iteratively (games can be hundreds of plies long) and
+        // incrementally, without replaying moves through FischerCore's `Game`.
+        var work: [(PositionNode, [AnnotatedMoveNode])] = [(root, game.tree.children)]
+        while let (parent, children) = work.popLast() {
             for (index, child) in children.enumerated() {
-                var next = parentGame
-                guard (try? next.execute(resolvedMove: child.move, considerHalfmoves: false)) != nil else { continue }
-                let info = MoveInfo(board: parent.board, resolved: child.move)
                 let nags = child.annotations.nags.map(\.rawValue) + child.annotations.otherNAGCodes
-                let node = PositionNode(parent: parent, childIndex: index, board: BoardState(game: next), move: info,
-                                        pieceIDs: Self.pieceIDs(next), comments: child.annotations.comments,
-                                        nags: nags, moveNumber: Int(next.fullmoves))
+                guard let node = parent.child(from: child.move.move.start.rawValue, to: child.move.move.end.rawValue,
+                                              promotion: child.move.promotion.map { CQLPieceKind($0.kind) },
+                                              index: index, comments: child.annotations.comments, nags: nags) else {
+                    continue
+                }
                 parent.children.append(node)
-                work.append((node, next, child.children))
+                work.append((node, child.children))
             }
         }
         self.root = root
@@ -209,20 +252,17 @@ public final class GameTree: @unchecked Sendable {
         self.readIssues = []
         self.tags = tags
 
-        let root = PositionNode(parent: nil, childIndex: 0, board: BoardState(game: start), move: nil,
-                                pieceIDs: Self.pieceIDs(start), comments: [], nags: [], moveNumber: Int(start.fullmoves))
+        let board = BoardState(game: start)
+        let root = PositionNode(parent: nil, childIndex: 0, board: board, move: nil,
+                                ids: PositionNode.initialIDs(board), comments: [], nags: [],
+                                moveNumber: Int(start.fullmoves))
         var parent = root
-        var game = start
         for (index, move) in moves.enumerated() {
-            let info = MoveInfo(board: parent.board, resolved: move)
-            do {
-                try game.execute(resolvedMove: move, considerHalfmoves: false)
-            } catch {
+            guard let node = parent.child(from: move.move.start.rawValue, to: move.move.end.rawValue,
+                                          promotion: move.promotion.map { CQLPieceKind($0.kind) }, index: 0) else {
                 throw GameReadError(gameNumber: gameNumber, byteOffset: 0,
                                     reason: "illegal move \(move.move) at ply \(index + 1)")
             }
-            let node = PositionNode(parent: parent, childIndex: 0, board: BoardState(game: game), move: info,
-                                    pieceIDs: Self.pieceIDs(game), comments: [], nags: [], moveNumber: Int(game.fullmoves))
             parent.children.append(node)
             parent = node
         }
@@ -257,9 +297,6 @@ public final class GameTree: @unchecked Sendable {
         for node in nodes { node.children = [] }
     }
 
-    private static func pieceIDs(_ game: Game) -> [Int?] {
-        Square.allCases.map { game.pieceID(at: $0)?.rawValue }
-    }
 
     /// Reads every game in a PGN string, throwing on the first game that
     /// cannot be read. Use ``read(pgn:)`` to skip unreadable games instead.
